@@ -1,0 +1,3 @@
+baseURL = "https://ftnt-dspille.github.io/fortisoar-tips-and-tricks"
+canonifyURLs = false
+relativeURLs = false

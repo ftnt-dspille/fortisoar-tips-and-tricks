@@ -1,0 +1,68 @@
+display_information:
+  name: FortiSOAR For Slack
+  description: Leverage power of FortiSOAR from Slack
+  background_color: "#222424"
+  long_description: "FortiSOAR App for Slack allows to invoke several commands such as creating indicator, alert, invoking playbook etc. actions.\r
+
+    \r
+
+    Following quick commands can be used - \r
+
+    \r
+
+    • Create Alert\r
+
+    • Create Indicator\r
+
+    • Invoke Any Playbook"
+features:
+  app_home:
+    home_tab_enabled: true
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  bot_user:
+    display_name: FortiSOAR
+    always_online: true
+  shortcuts:
+    - name: Create Indicator
+      type: global
+      callback_id: fsr_createIndicator
+      description: Creates an indicator in FortiSOAR
+    - name: FSR > Enrich IP
+      type: message
+      callback_id: fsr_enrichIP
+      description: Adds selected IP value in FSR and gets its latest reputation
+    - name: Create Alert
+      type: global
+      callback_id: fsr_createAlert
+      description: Creates an alert in FortiSOAR
+  slash_commands:
+    - command: /fortisoar
+      description: Leverage the power of FortiSOAR from Slack
+      usage_hint: "[createAlert, createIndicator, invokePlaybook, help]"
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - bookmarks:read
+      - channels:history
+      - chat:write
+      - chat:write.public
+      - commands
+      - incoming-webhook
+      - pins:read
+      - users.profile:read
+      - users:read
+      - users:read.email
+      - metadata.message:read
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_home_opened
+      - app_mention
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
