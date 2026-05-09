@@ -1,23 +1,18 @@
-<a id="logo" href='{{relURL "index.html"}}' title="Fortinet TEC Program">
-  <img
-    style="vertical-align: middle"
-    src='{{if (eq .Site.Params.themeVariant "Xperts2023") }}
-        {{- "/images/xperts-2023-2-lines.svg" -}}
-        {{ else if (eq .Site.Params.themeVariant "Xperts2024")}}
-         {{- "/images/xperts-2024-2-lines.svg" -}}
-    {{ else if (eq .Site.Params.themeVariant "Workshop")}}
-        {{- "/images/white-logo.svg" -}}
+<a id="logo" href="{{- "index.html" | relURL -}}" title="{{ .Site.Title }}">
+  <img style="vertical-align: middle" height="70px" />
+  <logoBanner id="title">
+    {{ with .Site.Params.logoBannerText }}
+      {{ . }}
     {{ else }}
-        {{- "/images/logo.svg" -}}
-    {{end}}'
-    height="70px"
-  />
-
-  {{ with .Site.Params.logoBannerText }}
-  <logoBanner id="title"> {{ . }} </logoBanner>
-  {{ else }}
-  <logoBanner id="title"> {{ $.Site.Params.themeVariant }} </logoBanner>
-  {{ end }}
+      {{- with $.Site.Params.themeVariant -}}
+        {{- if reflect.IsSlice . -}}
+          {{- index . 0 -}}
+        {{- else -}}
+          {{- . -}}
+        {{- end -}}
+      {{- end -}}
+    {{ end }}
+  </logoBanner>
 
   <logoBannerFreeForm id="subtitle">
     {{ $.Site.Params.logoBannerSubText }}
