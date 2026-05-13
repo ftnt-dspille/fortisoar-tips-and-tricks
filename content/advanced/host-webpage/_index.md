@@ -458,34 +458,91 @@ sudo systemctl status byo-app.service
 
 The Flask deployment above is one shape of the pattern. The underlying mechanism — *use FortiSOAR's existing JWT instead of inventing your own auth* — works for any page or service that lives on (or talks to) the appliance. Pick the pattern that fits what you're building.
 
-### Pattern A — Any HTML page served from the appliance origin
+{{% notice info "Quick guidance for in-browser pages" %}}
+For anything that runs in a user's browser, **prefer Pattern B (cs-iframe with `auth="true"`)**. FortiSOAR hands your page the decrypted JWT on the query string, and you don't depend on any FSR-internal constants. Pattern A — reading `localStorage["cs.TOKEN"]` directly — is more flexible (lets your page live in its own browser tab outside a widget container) but requires decrypting the token with constants compiled into the SPA, which can rotate across major FSR versions. Use A only when you specifically need standalone-tab UX and accept the brittleness.
+{{% /notice %}}
 
-If your page lives at `https://<your-fsr>/byo-app/...` (or `/your-thing/...` — anything served by the appliance's nginx), it shares an origin with the FortiSOAR SPA. That means it can read the user's JWT directly from `localStorage` and call any `/api/3/*` endpoint on the user's behalf — no extra login flow, no service account, no key management. The token is whatever FortiSOAR stored when the user logged into the SPA in this browser session.
+### Pattern B (recommended for in-browser) — Custom widgets embedded in the FortiSOAR designer
+
+FortiSOAR's `cs-iframe` directive is the supported way to embed your page inside a record view, dashboard, or any other widget container. When `auth="true"` is set, FortiSOAR appends `?token=<jwt>` to the iframe's `src` automatically, with **the JWT already decrypted** — you don't need any keys, any constants, or any knowledge of how FSR stores its tokens internally.
+
+The entire widget HTML can be one line:
+
+```html
+<div cs-iframe="'/byo-app/iframe-bootstrap'" auth="true" style="height:300px"></div>
+```
+
+Inside the iframe, read the token off the query string and send it as Bearer:
+
+```javascript
+// /byo-app/iframe.js — loaded by iframe-bootstrap.html
+const tok = new URLSearchParams(location.search).get("token");
+if (!tok) {
+  // FortiSOAR didn't append a token. Either auth="true" is missing from the
+  // widget directive, or the page wasn't loaded inside the FortiSOAR SPA.
+  document.body.textContent = "no token — open this through the FortiSOAR UI";
+} else {
+  fetch("/api/3/actors/current", {headers: {Authorization: "Bearer " + tok}})
+    .then(r => r.json())
+    .then(actor => { /* ...render... */ });
+}
+```
+
+When this pattern fits:
+- Embedding a third-party UI (FortiAnalyzer view, FortiManager dashboard, Grafana panel) inside a FortiSOAR record.
+- Custom forms / data-entry pages that live next to a record's other widgets.
+- Any in-browser experience that can reasonably be presented inside a FortiSOAR widget frame — even a full-width dashboard panel counts.
+
+Gotchas:
+- The iframe runs in a separate browsing context, so it does **not** share `localStorage` with the parent FortiSOAR tab — that's *why* `auth="true"` injects the token via query string. Don't try to `parent.localStorage` your way around it.
+- The token in the URL is logged anywhere the URL is logged (browser history, server access logs). If that's a problem for your threat model, use Pattern C instead and have the iframe POST its token to a same-origin backend that swaps it for a session cookie.
+
+### Pattern A (advanced) — Standalone page that decrypts `cs.TOKEN` itself
+
+Use this only when you genuinely need your page to live in its own browser tab (not inside a FortiSOAR widget frame). `cs.TOKEN` in `localStorage` is **not the JWT** — it's the JWT AES-CBC-encrypted with a static key compiled into FortiSOAR's SPA. The SPA's own `Cryptography` service decrypts it before every `/api/*` call. Your page has to do the same.
+
+{{% notice warning "Brittle by design" %}}
+The key and IV below are read directly from FortiSOAR's compiled bundle (`/opt/cyops-ui/js/app.unmin.js`, factory `Cryptography`). Fortinet can rotate these constants in any major release. If a future version stops accepting your decrypted Bearer header, re-grep the SPA bundle for `Hex.parse(` near `setAuthToken`/`getAuthToken` and update the constants in your page. There is no public, supported API for this — that's why Pattern B is the recommended default.
+{{% /notice %}}
 
 ```html
 <!doctype html>
 <meta charset=utf-8>
 <title>my page</title>
-<!-- external file because FortiSOAR's CSP blocks inline scripts — see Troubleshooting -->
+<!-- Re-use the same CryptoJS bundle the FortiSOAR SPA already loads, so no extra
+     download and same-origin satisfies CSP. The hash in the filename can change
+     across FSR upgrades — grep the SPA index.html for the current name if this
+     ever 404s. -->
+<script src="/node_modules/crypto-js/crypto-js.4b481d28.js"></script>
 <script src="/byo-app/my-page.js"></script>
 ```
 
 ```javascript
-// /byo-app/my-page.js
+// /byo-app/my-page.js — Pattern A: decrypt cs.TOKEN, then Bearer the JWT.
+const CS_KEY = CryptoJS.enc.Hex.parse("TqbJOgIReo3WvB7NMr40aypFs1dAayk8");
+const CS_IV  = CryptoJS.enc.Hex.parse("c5gWi0MD8fQPexUZLVlsISHmzkrLlC7X");
+
 function getToken() {
-  const raw = localStorage.getItem("cs.TOKEN") || "";
-  // FortiSOAR stores it as a JSON-stringified string in some builds and as a
-  // raw string in others. Handle both.
-  try { return JSON.parse(raw); } catch (e) { return raw; }
+  const stored = localStorage.getItem("cs.TOKEN") || "";
+  if (!stored) return "";  // user is not logged into FortiSOAR
+  try {
+    const params = CryptoJS.lib.CipherParams.create({
+      ciphertext: CryptoJS.enc.Base64.parse(stored)
+    });
+    return CryptoJS.AES.decrypt(params, CS_KEY, {iv: CS_IV})
+      .toString(CryptoJS.enc.Utf8);
+  } catch (e) {
+    return "";  // ciphertext corrupted or constants rotated
+  }
 }
 
 async function callFortiSOAR(method, path, body) {
-  const tok = getToken();
-  if (!tok) throw new Error("not logged in to FortiSOAR");
+  const jwt = getToken();
+  if (!jwt) throw new Error("not logged in to FortiSOAR, or cs.TOKEN could not be decrypted");
   const r = await fetch(path, {
     method,
     headers: {
-      "Authorization": "Bearer " + tok,
+      "Authorization": "Bearer " + jwt,   // jwt, not the ciphertext
       "Accept": "application/json",
       ...(body ? {"Content-Type": "application/json"} : {})
     },
@@ -495,57 +552,21 @@ async function callFortiSOAR(method, path, body) {
   return r.json();
 }
 
-// Example: who is the logged-in user
 callFortiSOAR("GET", "/api/3/actors/current").then(actor => {
   document.body.textContent = "Hello " + actor.firstname + " " + actor.lastname;
 });
 ```
 
-**This is what FortiSOAR's own SPA does** — the `AuthenticationInterceptor` reads `cs.TOKEN` and stamps it onto every `/api/*` call. Re-using it from your page is the path of least surprise. No nginx auth gating, no extra moving parts.
+How to recognize the failure mode if you forget the decrypt step: the request goes out as `Authorization: Bearer YrjE9t3/Fq8MJa...` (note the leading `YrjE` — that's base64-encoded ciphertext) instead of `Authorization: Bearer eyJ...` (the JWT proper), and FortiSOAR returns `401 An authentication exception occurred.` The Network tab is the fastest way to spot it.
 
 When this pattern fits:
-- Static dashboards, custom reports, internal tools that just need to read FortiSOAR data and render.
-- React, Vue, Angular, plain HTML — anything that runs in the user's browser.
-- Hugo/Jekyll/etc. static sites that you serve from `/opt/byo-app/static/` through your nginx location.
+- Truly standalone tools (a dashboard you want to open in its own tab and bookmark, an admin console that doesn't make sense inside a record widget).
+- Static sites generated by Hugo/Jekyll/etc. that you serve from `/opt/byo-app/static/` and want to surface to logged-in users without a backend.
 
 When it doesn't:
-- Server-to-server work where there is no logged-in user driving the request (use Pattern D).
-- Anything where you can't get your code served from the FortiSOAR appliance origin (you'd have a CORS problem and an SSO problem at the same time).
-
-### Pattern B — Custom widgets embedded in the FortiSOAR designer
-
-FortiSOAR's `cs-iframe` directive is the supported way to embed your page inside a record view, dashboard, or any other widget container. When `auth="true"` is set, FortiSOAR appends `?token=<jwt>` to the iframe's `src` automatically.
-
-The entire widget HTML can be one line:
-
-```html
-<div cs-iframe="'/byo-app/iframe-bootstrap'" auth="true" style="height:300px"></div>
-```
-
-Inside the iframe, read the token off the query string:
-
-```javascript
-// /byo-app/iframe.js — loaded by iframe-bootstrap.html
-const tok = new URLSearchParams(location.search).get("token");
-if (!tok) {
-  // FortiSOAR didn't append a token. Either auth="true" is missing from the
-  // widget directive, or the widget wasn't loaded inside the FortiSOAR SPA.
-  document.body.textContent = "no token — open this through the FortiSOAR UI";
-} else {
-  // Same Bearer call as Pattern A.
-  fetch("/api/3/actors/current", {headers: {Authorization: "Bearer " + tok}})
-    .then(r => r.json())
-    .then(actor => { /* ...render... */ });
-}
-```
-
-When this pattern fits:
-- Embedding a third-party UI (FortiAnalyzer view, FortiManager dashboard, Grafana panel) inside a FortiSOAR record.
-- Custom forms / data-entry pages that need to live next to a record's other widgets.
-
-Gotchas:
-- The iframe runs in a separate browsing context, so it does **not** share `localStorage` with the parent FortiSOAR tab — that's *why* `auth="true"` injects the token via query string. Don't try to `parent.localStorage` your way around it.
-- The token in the URL is logged anywhere the URL is logged (browser history, server access logs). If that's a problem for your threat model, use Pattern C instead and have the iframe POST its token to a same-origin backend that swaps it for a session cookie.
+- Anything that can plausibly live inside a FortiSOAR widget container — use Pattern B for the durability win.
+- Server-to-server work — use Pattern C or D.
+- Pages served from a different origin than the appliance — `localStorage` won't be visible to you.
 
 ### Pattern C — Backend services on the appliance, in any language
 
@@ -611,12 +632,14 @@ Key differences from Pattern C:
 
 | You're building... | Pattern |
 |---|---|
-| A page that lives at the FortiSOAR origin and just needs to call `/api/*` from JS | A |
-| A page that gets embedded inside a FortiSOAR record view via a custom widget | B |
-| A backend service that does work on behalf of a logged-in user | C |
-| A backend service that runs without a user (cron, webhook, agent) | D |
+| A page that gets embedded inside a FortiSOAR record view, dashboard, or widget container | **B** (recommended) |
+| A standalone page that opens in its own browser tab (not inside a widget frame) | **A** (advanced, brittle) |
+| A backend service that does work on behalf of a logged-in user | **C** |
+| A backend service that runs without a user (cron, webhook, agent) | **D** |
 
 A and B both run in the browser and use the user's identity. C wraps that identity with a server-side check. D is the only one that introduces a separate credential.
+
+If you're not sure between A and B, default to B — it's more durable across FSR upgrades and you don't need to know anything about how FortiSOAR stores tokens internally.
 
 ---
 
