@@ -27,6 +27,10 @@ The Flask app and the FortiSOAR API live on the same appliance, so it's tempting
 
 **Embedded inside the FortiSOAR designer.** If you load this app via a custom widget using the `cs-iframe="..." auth="true"` directive, FortiSOAR appends `?token=<jwt>` to the iframe URL on load. Your Flask app can read that token and use it as `Authorization: Bearer <token>` for any callbacks to `/api/3/*`. See the *Integration patterns* section at the end.
 
+{{% notice tip "Not building a Flask app?" %}}
+The Flask deployment in Steps 1-4 is one concrete shape, but **the auth pattern is the same regardless of language or stack**. If you're embedding a static dashboard, hosting a React/Vue/Angular app, wiring a Node/Go backend, or just using `cs-iframe` to embed a third-party page inside a FortiSOAR record — skip ahead to *Integration patterns* below. You probably don't need most of Steps 3-4 (gunicorn / systemd are Flask-specific) but you absolutely want Step 2 (nginx include) and the pattern catalogue.
+{{% /notice %}}
+
 ---
 
 ## Prerequisites
@@ -291,18 +295,16 @@ sudo sed -i '$ i\    include /etc/nginx/byo-app.locations;' /etc/nginx/conf.d/cy
 An FSR RPM upgrade may write a new `cyops-api.conf` and stash yours as `cyops-api.conf.rpmnew`. If `/byo-app/` stops responding after an upgrade, diff the two files and re-add the one `include /etc/nginx/byo-app.locations;` line into the new copy. Because the locations file itself lives outside `conf.d/`, it is untouched by the upgrade.
 {{% /notice %}}
 
-#### 2.2 Configuration Validation
-
-Test and reload the Nginx configuration:
+#### 2.5 Validate and (re)start nginx
 
 ```bash
-# Test configuration syntax
 sudo nginx -t
 
-# If test passes, reload Nginx
-sudo systemctl reload nginx
+# IMPORTANT: a plain `systemctl reload nginx` does NOT always pick up changes
+# that come in via include files. If your /byo-app/ requests fall through to
+# the FortiSOAR SPA after reload, do a full restart.
+sudo systemctl restart nginx
 
-# Verify Nginx status
 sudo systemctl status nginx
 ```
 
@@ -441,6 +443,172 @@ sudo systemctl start byo-app.service
 sudo systemctl status byo-app.service
 ```
 
+## Integration patterns — hooking other pages into FortiSOAR's built-in auth
+
+The Flask deployment above is one shape of the pattern. The underlying mechanism — *use FortiSOAR's existing JWT instead of inventing your own auth* — works for any page or service that lives on (or talks to) the appliance. Pick the pattern that fits what you're building.
+
+### Pattern A — Any HTML page served from the appliance origin
+
+If your page lives at `https://<your-fsr>/byo-app/...` (or `/your-thing/...` — anything served by the appliance's nginx), it shares an origin with the FortiSOAR SPA. That means it can read the user's JWT directly from `localStorage` and call any `/api/3/*` endpoint on the user's behalf — no extra login flow, no service account, no key management. The token is whatever FortiSOAR stored when the user logged into the SPA in this browser session.
+
+```html
+<!doctype html>
+<meta charset=utf-8>
+<title>my page</title>
+<!-- external file because FortiSOAR's CSP blocks inline scripts — see Troubleshooting -->
+<script src="/byo-app/my-page.js"></script>
+```
+
+```javascript
+// /byo-app/my-page.js
+function getToken() {
+  const raw = localStorage.getItem("cs.TOKEN") || "";
+  // FortiSOAR stores it as a JSON-stringified string in some builds and as a
+  // raw string in others. Handle both.
+  try { return JSON.parse(raw); } catch (e) { return raw; }
+}
+
+async function callFortiSOAR(method, path, body) {
+  const tok = getToken();
+  if (!tok) throw new Error("not logged in to FortiSOAR");
+  const r = await fetch(path, {
+    method,
+    headers: {
+      "Authorization": "Bearer " + tok,
+      "Accept": "application/json",
+      ...(body ? {"Content-Type": "application/json"} : {})
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (!r.ok) throw new Error("FortiSOAR returned HTTP " + r.status);
+  return r.json();
+}
+
+// Example: who is the logged-in user
+callFortiSOAR("GET", "/api/3/actors/current").then(actor => {
+  document.body.textContent = "Hello " + actor.firstname + " " + actor.lastname;
+});
+```
+
+**This is what FortiSOAR's own SPA does** — the `AuthenticationInterceptor` reads `cs.TOKEN` and stamps it onto every `/api/*` call. Re-using it from your page is the path of least surprise. No nginx auth gating, no extra moving parts.
+
+When this pattern fits:
+- Static dashboards, custom reports, internal tools that just need to read FortiSOAR data and render.
+- React, Vue, Angular, plain HTML — anything that runs in the user's browser.
+- Hugo/Jekyll/etc. static sites that you serve from `/opt/byo-app/static/` through your nginx location.
+
+When it doesn't:
+- Server-to-server work where there is no logged-in user driving the request (use Pattern D).
+- Anything where you can't get your code served from the FortiSOAR appliance origin (you'd have a CORS problem and an SSO problem at the same time).
+
+### Pattern B — Custom widgets embedded in the FortiSOAR designer
+
+FortiSOAR's `cs-iframe` directive is the supported way to embed your page inside a record view, dashboard, or any other widget container. When `auth="true"` is set, FortiSOAR appends `?token=<jwt>` to the iframe's `src` automatically.
+
+The entire widget HTML can be one line:
+
+```html
+<div cs-iframe="'/byo-app/iframe-bootstrap'" auth="true" style="height:300px"></div>
+```
+
+Inside the iframe, read the token off the query string:
+
+```javascript
+// /byo-app/iframe.js — loaded by iframe-bootstrap.html
+const tok = new URLSearchParams(location.search).get("token");
+if (!tok) {
+  // FortiSOAR didn't append a token. Either auth="true" is missing from the
+  // widget directive, or the widget wasn't loaded inside the FortiSOAR SPA.
+  document.body.textContent = "no token — open this through the FortiSOAR UI";
+} else {
+  // Same Bearer call as Pattern A.
+  fetch("/api/3/actors/current", {headers: {Authorization: "Bearer " + tok}})
+    .then(r => r.json())
+    .then(actor => { /* ...render... */ });
+}
+```
+
+When this pattern fits:
+- Embedding a third-party UI (FortiAnalyzer view, FortiManager dashboard, Grafana panel) inside a FortiSOAR record.
+- Custom forms / data-entry pages that need to live next to a record's other widgets.
+
+Gotchas:
+- The iframe runs in a separate browsing context, so it does **not** share `localStorage` with the parent FortiSOAR tab — that's *why* `auth="true"` injects the token via query string. Don't try to `parent.localStorage` your way around it.
+- The token in the URL is logged anywhere the URL is logged (browser history, server access logs). If that's a problem for your threat model, use Pattern C instead and have the iframe POST its token to a same-origin backend that swaps it for a session cookie.
+
+### Pattern C — Backend services on the appliance, in any language
+
+If you're building a service (not a page) that needs to call FortiSOAR on behalf of a logged-in user, the canonical move is:
+
+1. Your service is reachable through the appliance's nginx (Step 2 in this guide gives you `/byo-app/` as the example mount point).
+2. nginx forwards `Authorization: Bearer <jwt>` from the user's request into your service (`proxy_set_header Authorization $http_authorization;`).
+3. Your service validates the token by calling FortiSOAR's *own* "who is this" endpoint and acting on the response.
+
+The validating call is `GET /api/3/actors/current` — **not** `/api/3/people/current`, which does not exist. A `200` proves the caller is a logged-in user and the response body is their Actor record (user *or* appliance principal). Anything else means the token is bad, expired, or revoked — refuse the request.
+
+Python (Flask, as in this guide):
+
+```python
+def whoami():
+    r = requests.get(f"{FSR_BASE}/api/3/actors/current",
+                     headers={"Authorization": request.headers.get("Authorization", "")},
+                     verify=VERIFY, timeout=10)
+    if r.status_code != 200:
+        return jsonify({"error": "rejected by FortiSOAR"}), 401
+    return jsonify(r.json())
+```
+
+Node.js (Express):
+
+```javascript
+app.get("/whoami", async (req, res) => {
+  const r = await fetch(`${process.env.FSR_BASE_URL}/api/3/actors/current`, {
+    headers: { Authorization: req.headers.authorization || "" }
+  });
+  if (!r.ok) return res.status(401).json({ error: "rejected by FortiSOAR" });
+  res.json(await r.json());
+});
+```
+
+cURL (when you just want to test the pattern by hand):
+
+```bash
+curl -ks https://localhost/api/3/actors/current -H "Authorization: Bearer $JWT"
+```
+
+`FSR_BASE_URL` should be `https://localhost` in most single-node deployments — your service sits on the same appliance as nginx, so the call never leaves the box. If your appliance is fronted by a gateway that issues its own JWTs (multi-appliance or lab topologies), point `FSR_BASE_URL` at the URL the *user's browser* used. Tokens issued by appliance A are not valid against appliance B's `/api/*`.
+
+### Pattern D — Service identity (no user), via HMAC API key
+
+If your code needs to act on its own behalf, not on behalf of a user — for example, a cron job, a webhook receiver, or an agent that runs without a human in the loop — JWT is the wrong tool. Use an HMAC API key instead.
+
+1. In the FortiSOAR UI, **Settings → API Keys → Create**. Pick a role with only the permissions you need.
+2. Copy the key (you only see it once). Store it as a secret on the appliance; never commit it to a repo.
+3. Send it as `Authorization: API-KEY <hex>` — note the literal word `API-KEY`, not `Bearer`. FortiSOAR distinguishes the two on the wire.
+
+```python
+headers = {"Authorization": f"API-KEY {os.environ['FSR_API_KEY']}"}
+r = requests.get("https://localhost/api/3/alerts", headers=headers, verify=False)
+```
+
+Key differences from Pattern C:
+- HMAC keys do not expire, so leakage is much worse. Rotate them; restrict by role.
+- RBAC scoping is whatever role you gave the key — there is no "user". Audit log entries show the key's owning user, not the human who triggered the action.
+- Use Pattern D only when there is genuinely no user. If a user clicked a button and a service is acting on that click, Pattern C (forward their JWT) is the right answer — it preserves their identity in audit and respects their role.
+
+### Choosing between A / B / C / D
+
+| You're building... | Pattern |
+|---|---|
+| A page that lives at the FortiSOAR origin and just needs to call `/api/*` from JS | A |
+| A page that gets embedded inside a FortiSOAR record view via a custom widget | B |
+| A backend service that does work on behalf of a logged-in user | C |
+| A backend service that runs without a user (cron, webhook, agent) | D |
+
+A and B both run in the browser and use the user's identity. C wraps that identity with a server-side check. D is the only one that introduces a separate credential.
+
+---
+
 ## Testing and Validation
 
 ### Functional Testing
@@ -539,6 +707,26 @@ EOF
   sudo setsebool -P httpd_can_network_connect 1
   sudo restorecon -R /opt/byo-app
   ```
+
+#### Buttons or interactive JS in `/byo-app/` does nothing — CSP blocks inline
+
+**Symptoms**: The page loads with no styling and clicking buttons does nothing. Browser console shows:
+```
+Applying inline style violates the following Content Security Policy directive 'default-src self'.
+Executing inline script violates the following Content Security Policy directive 'default-src self'.
+```
+
+**Cause**: The FortiSOAR appliance sets a global `Content-Security-Policy: default-src self;` header in nginx. Any `<script>...</script>` or `<style>...</style>` block inline in your HTML is rejected by the browser. Same for `style="..."` attributes.
+
+**Fix**: Move all JS to external `.js` files and all CSS to external `.css` files, served by your Flask app (or as static files via the `/byo-app/static/` location from Step 2). Reference them with `<script src="...">` and `<link rel="stylesheet" href="...">`. They satisfy `'self'` automatically because they're served from the same origin.
+
+#### Navigating to `/byo-app/` from inside the FortiSOAR UI doubles the path
+
+**Symptoms**: User clicks a link or types `/byo-app/` while a FortiSOAR tab is open; the address bar ends up showing `/byo-app/byo-app/` and the page either 404s or falls through to the SPA.
+
+**Cause**: FortiSOAR's AngularJS `ui-router` is loaded in any tab where the SPA is open. It intercepts in-tab URL changes and re-routes them through its own state engine, which composes paths against the current state instead of replacing them.
+
+**Fix**: Open your page in a **new tab**, not by typing into the FortiSOAR tab's address bar. Same-origin tabs share `localStorage` so `cs.TOKEN` still carries; you just avoid the ui-router interception.
 
 #### 502 Bad Gateway Error
 
