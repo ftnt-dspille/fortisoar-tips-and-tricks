@@ -462,39 +462,135 @@ The Flask deployment above is one shape of the pattern. The underlying mechanism
 For anything that runs in a user's browser, **prefer Pattern B (cs-iframe with `auth="true"`)**. FortiSOAR hands your page the decrypted JWT on the query string, and you don't depend on any FSR-internal constants. Pattern A — reading `localStorage["cs.TOKEN"]` directly — is more flexible (lets your page live in its own browser tab outside a widget container) but requires decrypting the token with constants compiled into the SPA, which can rotate across major FSR versions. Use A only when you specifically need standalone-tab UX and accept the brittleness.
 {{% /notice %}}
 
-### Pattern B (recommended for in-browser) — Custom widgets embedded in the FortiSOAR designer
+### Pattern B (recommended for in-browser) — Custom widget that embeds your page
 
-FortiSOAR's `cs-iframe` directive is the supported way to embed your page inside a record view, dashboard, or any other widget container. When `auth="true"` is set, FortiSOAR appends `?token=<jwt>` to the iframe's `src` automatically, with **the JWT already decrypted** — you don't need any keys, any constants, or any knowledge of how FSR stores its tokens internally.
+FortiSOAR has a `cs-iframe` AngularJS directive that the platform documentation describes as the "supported" way to embed an external page. On paper its contract is:
 
-The entire widget HTML can be one line:
+- `cs-iframe="<url-expression>"` — same-origin URL to load
+- `auth="true"` — append the decrypted user JWT to the URL as `?token=<jwt>`
+- `iframe-height="<number>"` — height in pixels
 
-```html
-<div cs-iframe="'/byo-app/iframe-bootstrap'" auth="true" style="height:300px"></div>
+The directive is real — its source lives in `app.unmin.js` and registers correctly — but on stock **FortiSOAR 7.6.x**, the directive's bundled template (`app/components/iframe/iframe.html` in `templates.min.<hash>.js`) ships as literally `<div></div>`. The link function appends the token to `url` and sets `trustedUrl`, but **no `<iframe>` element ever gets emitted**, so the widget body stays empty even though everything else (URL building, token forwarding, `iframeLoaded` callback) runs.
+
+The pragmatic answer is to render the `<iframe>` element yourself in a small custom widget. You still re-use FortiSOAR's `tokenService` to get the decrypted JWT — that's the same injectable `cs-iframe` uses internally — so you don't need any AES constants, any login flow, or any knowledge of FSR's internal token storage.
+
+#### A minimal working widget
+
+Four files under `widgets-src/byo-app-frame/widget/`:
+
+`info.json`
+```json
+{
+  "name": "byoAppFrame",
+  "title": "BYO App Frame",
+  "subTitle": "Embed a same-origin page; FortiSOAR forwards the user's JWT.",
+  "version": "1.0.0",
+  "published_date": 1747094400,
+  "metadata": {
+    "publisher": "You",
+    "certified": "No",
+    "compatibility": ["7.6.0"],
+    "pages": ["View Panel", "Dashboard"],
+    "category": ["Utilities"],
+    "standalone": false,
+    "windowClass": "Full Width",
+    "size": "lg"
+  }
+}
 ```
+
+`view.html`
+```html
+<div class="widget-container" style="padding: 8px 12px;">
+  <h5 data-ng-if="config.title">{{ config.title }}</h5>
+  <iframe data-ng-if="config.url && trustedUrl"
+          data-ng-src="{{ trustedUrl }}"
+          data-ng-style="{ height: (config.height || 400) + 'px', width: '100%', border: '0' }"
+          frameborder="0"
+          allowfullscreen>
+  </iframe>
+</div>
+```
+
+`view.controller.js`
+```javascript
+"use strict";
+(function () {
+  angular
+    .module("cybersponse")
+    .controller("byoAppFrame100Ctrl", byoAppFrame100Ctrl);
+
+  // tokenService is the same injectable cs-iframe uses internally to grab
+  // the user's decrypted JWT.
+  byoAppFrame100Ctrl.$inject = ["$scope", "config", "$sce", "tokenService"];
+
+  function byoAppFrame100Ctrl($scope, config, $sce, tokenService) {
+    $scope.config = angular.extend(
+      { url: "/byo-app/iframe-app", forwardToken: true, height: 400 },
+      config || {}
+    );
+
+    var url = $scope.config.url || "";
+    if ($scope.config.forwardToken) {
+      var jwt = (tokenService && tokenService.get && tokenService.get()) || "";
+      if (jwt) {
+        url += url.indexOf("?") >= 0 ? "&" : "?";
+        url += "token=" + encodeURIComponent(jwt);
+      }
+    }
+    // ng-src refuses to load anything but a few schemes against same-origin
+    // without trustAsResourceUrl. Empty iframe is what you get otherwise.
+    $scope.trustedUrl = url ? $sce.trustAsResourceUrl(url) : null;
+  }
+})();
+```
+
+(`edit.html` and `edit.controller.js` follow the standard widget-edit pattern from the FortiSOAR widget knowledgebase — see your team's existing widget repo for the boilerplate.)
 
 Inside the iframe, read the token off the query string and send it as Bearer:
 
 ```javascript
-// /byo-app/iframe.js — loaded by iframe-bootstrap.html
-const tok = new URLSearchParams(location.search).get("token");
+// /byo-app/iframe-app.js — loaded by /byo-app/iframe-app
+const tok = new URLSearchParams(location.search).get("token") || "";
 if (!tok) {
-  // FortiSOAR didn't append a token. Either auth="true" is missing from the
-  // widget directive, or the page wasn't loaded inside the FortiSOAR SPA.
   document.body.textContent = "no token — open this through the FortiSOAR UI";
 } else {
   fetch("/api/3/actors/current", {headers: {Authorization: "Bearer " + tok}})
     .then(r => r.json())
-    .then(actor => { /* ...render... */ });
+    .then(actor => { /* …render… */ });
 }
 ```
 
-When this pattern fits:
-- Embedding a third-party UI (FortiAnalyzer view, FortiManager dashboard, Grafana panel) inside a FortiSOAR record.
-- Custom forms / data-entry pages that live next to a record's other widgets.
-- Any in-browser experience that can reasonably be presented inside a FortiSOAR widget frame — even a full-width dashboard panel counts.
+#### Things the cs-iframe-as-shipped directive gets you to discover the hard way
 
-Gotchas:
-- The iframe runs in a separate browsing context, so it does **not** share `localStorage` with the parent FortiSOAR tab — that's *why* `auth="true"` injects the token via query string. Don't try to `parent.localStorage` your way around it.
+If you do try the documented `<div cs-iframe="..." auth="true">` one-liner first, you will run into these in order:
+
+1. **`auth` is a `=?` scope binding, not a literal attribute.** `auth="true"` works because `true` is a valid Angular expression evaluating to boolean `true`. Writing `data-ng-attr-auth="{{ config.flag ? 'true' : 'false' }}"` to compute it dynamically blows up the framework with `[$parse:syntax]` — the directive tries to `$parse` the curly-brace string as an expression. Use a static `auth="true"` and gate visibility with two `ng-if` branches if you need to make it conditional.
+2. **The directive calls `scope.$parent.iframeLoaded()` after the iframe `load` event.** Your widget's controller must define `$scope.iframeLoaded` or the page crashes with `iframeLoaded is not a function` and the widget never finishes mounting. Even an empty stub works.
+3. **And then the iframe body is still empty** because of the `<div></div>` template bug above. At that point switch to the manual `<iframe>` recipe.
+
+#### Pattern A index page vs. Pattern B iframe page — they are not the same page
+
+A subtle but important distinction. The page you render at `/byo-app/` for **Pattern A** reads the JWT from `localStorage["cs.TOKEN"]` (after decrypting it). The page you render at `/byo-app/iframe-app` for **Pattern B** reads the JWT from `?token=` in the URL. **`localStorage` is not shared between the parent FortiSOAR tab and the iframe** — they are separate browsing contexts — so pointing your widget at the Pattern A page will yield "Token: MISSING" inside the iframe even though the user is logged in.
+
+Have your Flask app (or static-site generator) expose **two endpoints** when you support both:
+
+| Endpoint | Reads JWT from | Mount via |
+|---|---|---|
+| `/byo-app/` | `localStorage["cs.TOKEN"]` (decrypted) | Direct browser tab (Pattern A) |
+| `/byo-app/iframe-app` | URL `?token=` query string | `cs-iframe` widget (Pattern B) |
+
+Same business logic, different five lines for picking up the JWT. Keeping them separate is cleaner than trying to write one page that handles both.
+
+#### Theming the iframe
+
+The iframe's document is its own browsing context — it does **not** inherit FortiSOAR's theme. If you don't set `background-color` and `color` on `body`, your iframe will render with a transparent body over the dark FSR dashboard background — dark text on dark, unreadable. Either ship dark-theme CSS yourself (recommended; gives you control and works standalone too) or query the parent for the active theme via `postMessage` and adapt at runtime.
+
+Also bear in mind that the output of an API call is often a long unbroken JSON value with no whitespace. `white-space: pre-wrap` won't break those — add `overflow-wrap: anywhere` and `word-break: break-word` on any element that displays raw response bodies, or they'll punch through the right edge of the widget.
+
+#### Gotchas (Pattern B in general)
+
+- The iframe runs in a separate browsing context, so it does **not** share `localStorage` with the parent FortiSOAR tab — that's *why* `auth="true"` (and our manual recipe) injects the token via query string. Don't try to `parent.localStorage` your way around it.
 - The token in the URL is logged anywhere the URL is logged (browser history, server access logs). If that's a problem for your threat model, use Pattern C instead and have the iframe POST its token to a same-origin backend that swaps it for a session cookie.
 
 ### Pattern A (advanced) — Standalone page that decrypts `cs.TOKEN` itself
