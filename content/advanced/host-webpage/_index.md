@@ -265,6 +265,16 @@ location /byo-app/ {
     # the JWT against /api/3/actors/current. Without this, the app cannot
     # tell who the caller is.
     proxy_set_header Authorization $http_authorization;
+
+    # Override the appliance's global Content-Security-Policy header. The
+    # default value in /etc/nginx/conf.d/cyops-api.conf is malformed:
+    #   add_header Content-Security-Policy "default-src self;" always;
+    # The `self` is unquoted, so the browser parses it as a hostname literal
+    # (and matches nothing) instead of "same origin". The result is that
+    # EVERY script/style — even same-origin external files — is blocked.
+    # Restate the policy with the quotes the browser actually wants so any
+    # /byo-app/*.js and /byo-app/*.css we serve can load.
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self';" always;
 }
 
 # Static files optimization (optional)
@@ -272,6 +282,7 @@ location /byo-app/static/ {
     alias /opt/byo-app/static/;
     expires 1d;
     add_header Cache-Control "public, immutable";
+    add_header Content-Security-Policy "default-src 'self';" always;
     access_log off;
 }
 EOF
@@ -708,17 +719,49 @@ EOF
   sudo restorecon -R /opt/byo-app
   ```
 
-#### Buttons or interactive JS in `/byo-app/` does nothing — CSP blocks inline
+#### Buttons / interactive JS do nothing, page is unstyled — appliance's CSP is misconfigured
 
-**Symptoms**: The page loads with no styling and clicking buttons does nothing. Browser console shows:
+**Symptoms**: The page renders but no styling is applied and clicking buttons does nothing. Browser console shows blocked-CSP errors. Two distinct flavors can appear:
+
 ```
-Applying inline style violates the following Content Security Policy directive 'default-src self'.
+# Flavor 1 — inline blocks rejected
 Executing inline script violates the following Content Security Policy directive 'default-src self'.
+Applying inline style violates the following Content Security Policy directive 'default-src self'.
+
+# Flavor 2 — same-origin external files ALSO rejected (the real surprise)
+Loading the script 'https://your-fsr/byo-app/app.js' violates the following CSP directive: "default-src self".
+Loading the stylesheet 'https://your-fsr/byo-app/app.css' violates the following CSP directive: "default-src self".
 ```
 
-**Cause**: The FortiSOAR appliance sets a global `Content-Security-Policy: default-src self;` header in nginx. Any `<script>...</script>` or `<style>...</style>` block inline in your HTML is rejected by the browser. Same for `style="..."` attributes.
+**Cause**: The appliance ships with a malformed global CSP in `/etc/nginx/conf.d/cyops-api.conf`:
 
-**Fix**: Move all JS to external `.js` files and all CSS to external `.css` files, served by your Flask app (or as static files via the `/byo-app/static/` location from Step 2). Reference them with `<script src="...">` and `<link rel="stylesheet" href="...">`. They satisfy `'self'` automatically because they're served from the same origin.
+```nginx
+add_header Content-Security-Policy "default-src self;" always;
+```
+
+Note the **unquoted `self`**. Per the CSP spec, `'self'` (quoted) means "same origin"; bare `self` is parsed as a hostname literal — and there is no host named `self`, so the policy effectively blocks **everything from everywhere**, including same-origin external files. FortiSOAR's own SPA escapes this by overriding the CSP with a quoted version on a different location block later in the same file, but anything you add (like `/byo-app/`) inherits the broken one.
+
+**Fix**: two steps, both already included in the `byo-app.locations` snippet in Step 2.3:
+
+1. **Override the CSP in your location block** so it sends a quoted, proper policy:
+   ```nginx
+   add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self';" always;
+   ```
+   The `add_header` at child level replaces inherited values entirely, so the broken parent header is hidden.
+
+2. **Keep your HTML clean of inline JS/CSS anyway** — even with the override above (which permits `'unsafe-inline'` to ease migration), inline scripts in CSP-strict environments are generally a smell. Move scripts to `/byo-app/*.js` and styles to `/byo-app/*.css` files served by your Flask app, and reference them with `<script src="...">` / `<link rel="stylesheet" href="...">`.
+
+**How to verify the fix is live**:
+
+```bash
+curl -ksI https://localhost/byo-app/ | grep -i content-security-policy
+# Expect:  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; ...
+# Note the QUOTED 'self'. If you see "default-src self;" with no quotes, your
+# override is not in effect — confirm byo-app.locations is included from
+# inside cyops-api.conf's server block and run `systemctl restart nginx`.
+```
+
+**Note for the security-conscious**: if you don't need `'unsafe-inline'`, drop it. The override is a starting point, not a target — tighten it to match the actual surface your app uses (no inline, nonce-based scripts, etc.).
 
 #### Navigating to `/byo-app/` from inside the FortiSOAR UI doubles the path
 
